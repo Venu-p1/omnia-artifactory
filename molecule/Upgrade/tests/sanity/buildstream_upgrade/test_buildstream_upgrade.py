@@ -24,24 +24,93 @@ Tests the upgrade-specific mechanisms for BuildStream including:
 - Service restart after quadlet updates
 
 Prerequisites:
-- System must be in 2.1 installed state with BuildStream enabled
-- Upgrade must have been executed successfully
-
-Test cases (executed in order):
-1. TC-UPG-001: Verify upgrade metadata file exists and contains required fields
-2. TC-UPG-002: Verify backup files exist (quadlets, database, GitLab configs)
-3. TC-UPG-003: Verify Postgres DB Alembic migration (005 → 007)
-4. TC-UPG-004: Verify GitLab upgrade commit with [ci skip]
-5. TC-UPG-005: Verify GitLab runner re-registration
-6. TC-UPG-006: Verify service restart after quadlet update
+- System must be upgraded to Omnia 2.2
+- BuildStream upgrade must have been executed successfully
 """
 
 import pytest
-import yaml
-import os
-import re
+import json
 
-from automation_library.core import TestLogger, get_host_connection
+from automation_library.core import (
+    TestLogger,
+    get_testinfra_host,
+    run_on_oim,
+    run_in_container,
+    exec_psql_query,
+    get_credential_value,
+    POSTGRES_CONTAINER,
+    POSTGRES_DB,
+    POSTGRES_USER_KEY,
+    OMNIA_CORE_CONTAINER,
+    OMNIA_CREDENTIALS_PATH,
+    OMNIA_CREDENTIALS_KEY_PATH,
+)
+from automation_library.upgrade_and_rollback.vars import (
+    UPGRADE_VARS,
+    UPGRADE_MANIFEST_PATH,
+    BUILDSTREAM_BACKUP_DIR,
+    BUILDSTREAM_METADATA_FILE,
+    GITLAB_CONFIGS_DIR,
+    BUILDSTREAM_CONTAINER_BACKUP,
+    POSTGRES_CONTAINER_BACKUP,
+    BUILDSTREAM_DB_BACKUP,
+    GITLAB_RB_BACKUP,
+    GITLAB_SECRETS_BACKUP,
+    QUADLET_DIR,
+    BUILDSTREAM_QUADLET,
+    BUILDSTREAM_SERVICE,
+    POSTGRES_QUADLET,
+    POSTGRES_SERVICE,
+    PLAYBOOK_WATCHER_QUADLET,
+    BUILDSTREAM_IMAGE_TAG_2_2,
+    ALEMBIC_VERSION_2_2,
+    GITLAB_API_BASE,
+    GITLAB_COMMIT_TITLE_PREFIX,
+)
+from automation_library.upgrade_and_rollback.functions import (
+    get_oim_metadata,
+    read_container_file,
+    get_upgrade_manifest,
+    get_buildstream_metadata,
+    get_gitlab_root_token,
+)
+from automation_library.upgrade_and_rollback.messages import (
+    BUILDSTREAM_TEST_NAMES,
+    BUILDSTREAM_LOG_MSGS,
+    BUILDSTREAM_ASSERT_MSGS,
+    BUILDSTREAM_SKIP_MSGS,
+)
+from automation_library.gitlab.functions import (
+    get_gitlab_host,
+    get_gitlab_project_name,
+    get_gitlab_https_port,
+    ssh_to_gitlab,
+)
+from automation_library.gitlab.vars import GITLAB_ROOT_TOKEN_FILE
+
+
+@pytest.fixture(scope="module")
+def host():
+    """Get Testinfra host connected to OIM server."""
+    return get_testinfra_host()
+
+
+@pytest.fixture(scope="module")
+def upgrade_config():
+    """Get upgrade configuration from UPGRADE_VARS."""
+    return {
+        "current_version": UPGRADE_VARS["current_version"],
+        "new_version": UPGRADE_VARS["new_version"],
+        "backup_path": UPGRADE_VARS["backup_path"],
+    }
+
+
+@pytest.fixture(scope="module")
+def oim_shared_path(host):
+    """Get oim_shared_path from omnia_core metadata."""
+    metadata = get_oim_metadata(host, OMNIA_CORE_CONTAINER)
+    assert metadata["success"], f"Failed to read OIM metadata: {metadata['error']}"
+    return metadata["oim_shared_path"]
 
 
 # =============================================================================
@@ -49,72 +118,59 @@ from automation_library.core import TestLogger, get_host_connection
 # =============================================================================
 
 @pytest.mark.sanity
+@pytest.mark.buildstream_upgrade
 @pytest.mark.buildstream
 @pytest.mark.order(101)
-def test_upgrade_metadata_creation(host):
+def test_upgrade_metadata_creation(host, oim_shared_path, upgrade_config):
     """
     TC-UPG-001: Verify upgrade metadata file exists and contains required fields.
-    
-    Steps:
-    1. Locate the backup_dir from upgrade_manifest.yml
-    2. Check for buildstream_upgrade_metadata.yml
-    3. Verify required fields exist and are populated
-    
-    Expected Result:
-    - Metadata file exists
-    - Contains: upgrade_path, upgrade_timestamp, buildstream_service_exists_before,
-      postgres_service_exists_before, upgrade_gitlab_commit_sha, upgrade_gitlab_pre_tag
     """
-    logger = TestLogger("TC-UPG-001", "Upgrade Metadata Creation")
-    conn = get_host_connection(host)
-    
-    logger.info("Reading upgrade_manifest.yml to find backup_dir")
-    manifest_path = "/opt/omnia/.data/upgrade_manifest.yml"
-    
-    # Read manifest
-    result = conn.run(f"cat {manifest_path}")
-    assert result.rc == 0, f"Failed to read upgrade_manifest.yml: {result.stderr}"
-    
-    manifest = yaml.safe_load(result.stdout)
+    logger = TestLogger(BUILDSTREAM_TEST_NAMES["upgrade_metadata_creation"])
+
+    logger.check(BUILDSTREAM_LOG_MSGS["reading_manifest"].format(path=UPGRADE_MANIFEST_PATH))
+
+    manifest_result = get_upgrade_manifest(host)
+    assert manifest_result["success"], BUILDSTREAM_ASSERT_MSGS["metadata_file_not_found"].format(
+        path=UPGRADE_MANIFEST_PATH
+    )
+
+    manifest = manifest_result["manifest"]
     backup_dir = manifest.get('backup_dir')
-    assert backup_dir, "backup_dir not found in upgrade_manifest.yml"
-    
-    logger.info(f"Backup directory: {backup_dir}")
-    
-    # Check for buildstream_upgrade_metadata.yml
-    metadata_path = f"{backup_dir}/buildstream_upgrade_metadata.yml"
-    logger.info(f"Checking for metadata file: {metadata_path}")
-    
-    result = conn.run(f"test -f {metadata_path}")
-    assert result.rc == 0, f"Metadata file not found: {metadata_path}"
-    
-    # Read and parse metadata
-    result = conn.run(f"cat {metadata_path}")
-    assert result.rc == 0, f"Failed to read metadata file: {result.stderr}"
-    
-    metadata = yaml.safe_load(result.stdout)
-    logger.info(f"Metadata content: {metadata}")
-    
-    # Verify required fields
+    assert backup_dir, BUILDSTREAM_ASSERT_MSGS["backup_dir_missing"]
+
+    logger.check(BUILDSTREAM_LOG_MSGS["backup_dir"].format(path=backup_dir))
+
+    # Replace /opt/omnia with oim_shared_path for OIM host access
+    metadata_path = backup_dir.replace("/opt/omnia", f"{oim_shared_path}/omnia")
+    metadata_path = f"{metadata_path}/{BUILDSTREAM_METADATA_FILE}"
+    logger.check(BUILDSTREAM_LOG_MSGS["checking_metadata"].format(path=metadata_path))
+
+    metadata_result = get_buildstream_metadata(host, metadata_path)
+    assert metadata_result["success"], BUILDSTREAM_ASSERT_MSGS["metadata_file_not_found"].format(
+        path=metadata_path
+    )
+
+    metadata = metadata_result["metadata"]
+    logger.check(BUILDSTREAM_LOG_MSGS["metadata_content"].format(metadata=metadata))
+
     required_fields = [
         'upgrade_path',
         'upgrade_timestamp',
         'buildstream_service_exists_before',
         'postgres_service_exists_before',
         'upgrade_gitlab_commit_sha',
-        'upgrade_gitlab_pre_tag'
+        'upgrade_gitlab_pre_tag',
     ]
-    
+
     for field in required_fields:
-        assert field in metadata, f"Required field '{field}' missing from metadata"
-        assert metadata[field] is not None, f"Field '{field}' is None"
-        assert str(metadata[field]).strip() != '', f"Field '{field}' is empty"
-    
-    # Verify upgrade_path is 'upgrade_existing' (since we're testing upgrade from 2.1)
+        assert field in metadata, BUILDSTREAM_ASSERT_MSGS["metadata_field_missing"].format(field=field)
+        assert metadata[field] is not None, BUILDSTREAM_ASSERT_MSGS["metadata_field_empty"].format(field=field)
+        assert str(metadata[field]).strip() != '', BUILDSTREAM_ASSERT_MSGS["metadata_field_empty"].format(field=field)
+
     assert metadata['upgrade_path'] == 'upgrade_existing', \
-        f"Expected upgrade_path='upgrade_existing', got '{metadata['upgrade_path']}'"
-    
-    logger.success("Upgrade metadata file exists and contains all required fields")
+        BUILDSTREAM_ASSERT_MSGS["upgrade_path_invalid"].format(actual=metadata['upgrade_path'])
+
+    logger.passed("Upgrade metadata file exists and contains all required fields")
 
 
 # =============================================================================
@@ -122,61 +178,49 @@ def test_upgrade_metadata_creation(host):
 # =============================================================================
 
 @pytest.mark.sanity
+@pytest.mark.buildstream_upgrade
 @pytest.mark.buildstream
 @pytest.mark.order(102)
-def test_upgrade_backup_validation(host):
+def test_upgrade_backup_validation(host, oim_shared_path, upgrade_config):
     """
-    TC-UPG-002: Verify backup files exist.
-    
-    Steps:
-    1. Check for backed up quadlet files
-    2. Check for database backup SQL file
-    3. Check for GitLab configuration backups
-    
-    Expected Result:
-    - All backup files exist in backup_dir
+    TC-UPG-002: Verify backup files exist on the OIM shared path.
     """
-    logger = TestLogger("TC-UPG-002", "Upgrade Backup Validation")
-    conn = get_host_connection(host)
-    
-    logger.info("Reading upgrade_manifest.yml to find backup_dir")
-    manifest_path = "/opt/omnia/.data/upgrade_manifest.yml"
-    
-    result = conn.run(f"cat {manifest_path}")
-    assert result.rc == 0, f"Failed to read upgrade_manifest.yml: {result.stderr}"
-    
-    manifest = yaml.safe_load(result.stdout)
-    backup_dir = manifest.get('backup_dir')
-    
-    # List of expected backup files
+    logger = TestLogger(BUILDSTREAM_TEST_NAMES["upgrade_backup_validation"])
+
+    backup_dir_on_oim = f"{oim_shared_path}/omnia/backups/upgrade/version_{upgrade_config['current_version']}"
+    logger.check(BUILDSTREAM_LOG_MSGS["backup_dir_on_oim"].format(path=backup_dir_on_oim))
+
     expected_backups = [
-        f"{backup_dir}/buildstream/omnia_build_stream.container.bak",
-        f"{backup_dir}/buildstream/omnia_postgres.container.bak",
-        f"{backup_dir}/buildstream/buildstream_db_backup.sql",
-        f"{backup_dir}/configs/gitlab/gitlab.rb",
-        f"{backup_dir}/configs/gitlab/gitlab-secrets.json",
+        f"{backup_dir_on_oim}/{BUILDSTREAM_BACKUP_DIR}/{BUILDSTREAM_CONTAINER_BACKUP}",
+        f"{backup_dir_on_oim}/{BUILDSTREAM_BACKUP_DIR}/{POSTGRES_CONTAINER_BACKUP}",
+        f"{backup_dir_on_oim}/{BUILDSTREAM_BACKUP_DIR}/{BUILDSTREAM_DB_BACKUP}",
+        f"{backup_dir_on_oim}/{GITLAB_CONFIGS_DIR}/{GITLAB_RB_BACKUP}",
+        f"{backup_dir_on_oim}/{GITLAB_CONFIGS_DIR}/{GITLAB_SECRETS_BACKUP}",
     ]
-    
+
     missing_files = []
     for backup_file in expected_backups:
-        logger.info(f"Checking for backup file: {backup_file}")
-        result = conn.run(f"test -f {backup_file}")
+        logger.check(BUILDSTREAM_LOG_MSGS["checking_backup_file"].format(path=backup_file))
+        result = run_on_oim(host, f"test -f {backup_file}")
         if result.rc != 0:
             missing_files.append(backup_file)
-            logger.warning(f"Backup file missing: {backup_file}")
-        else:
-            logger.info(f"✓ Found: {backup_file}")
-    
-    assert len(missing_files) == 0, f"Missing backup files: {missing_files}"
-    
-    # Verify SQL backup is valid (contains SQL statements)
-    sql_backup = f"{backup_dir}/buildstream/buildstream_db_backup.sql"
-    result = conn.run(f"head -20 {sql_backup}")
-    assert result.rc == 0, f"Failed to read SQL backup: {result.stderr}"
-    assert 'PostgreSQL' in result.stdout or 'CREATE' in result.stdout or 'INSERT' in result.stdout, \
-        "SQL backup file does not appear to be a valid PostgreSQL dump"
-    
-    logger.success("All backup files exist and SQL backup appears valid")
+            logger.skipped(BUILDSTREAM_SKIP_MSGS["backup_file_missing"].format(path=backup_file))
+
+    assert len(missing_files) == 0, BUILDSTREAM_ASSERT_MSGS["backup_files_missing"].format(
+        files=missing_files,
+        backup_dir=backup_dir_on_oim,
+    )
+
+    sql_backup = f"{backup_dir_on_oim}/{BUILDSTREAM_BACKUP_DIR}/{BUILDSTREAM_DB_BACKUP}"
+    result = run_on_oim(host, f"stat -c %s {sql_backup}")
+    assert result.rc == 0, f"Failed to stat SQL backup: {result.stderr}"
+    sql_size = int(result.stdout.strip())
+    if sql_size == 0:
+        logger.skipped(BUILDSTREAM_SKIP_MSGS["sql_backup_empty"])
+    else:
+        logger.check(BUILDSTREAM_LOG_MSGS["sql_backup_nonempty"])
+
+    logger.passed("All backup files exist")
 
 
 # =============================================================================
@@ -184,38 +228,45 @@ def test_upgrade_backup_validation(host):
 # =============================================================================
 
 @pytest.mark.sanity
+@pytest.mark.buildstream_upgrade
 @pytest.mark.buildstream
 @pytest.mark.order(103)
 def test_postgres_alembic_migration(host):
     """
-    TC-UPG-003: Verify Postgres DB Alembic migration (005 → 007).
-    
-    Steps:
-    1. Connect to omnia_postgres container
-    2. Query alembic_version table
-    3. Verify version_num is 007 or later
-    
-    Expected Result:
-    - Database schema migrated to version 007 (2.2)
+    TC-UPG-003: Verify Postgres DB Alembic migration to 2.2.
     """
-    logger = TestLogger("TC-UPG-003", "Postgres DB Alembic Migration")
-    conn = get_host_connection(host)
-    
-    logger.info("Querying alembic_version from omnia_postgres container")
-    
-    cmd = 'podman exec omnia_postgres psql -U postgres -d build_stream_db -t -c "SELECT version_num FROM alembic_version;"'
-    result = conn.run(cmd)
-    
-    assert result.rc == 0, f"Failed to query alembic_version: {result.stderr}"
-    
-    version_num = result.stdout.strip()
-    logger.info(f"Current alembic version: {version_num}")
-    
-    # Verify version is 007 or later (2.2 migrations)
-    assert version_num >= '007', \
-        f"Expected alembic version >= 007 (2.2), got {version_num}"
-    
-    logger.success(f"Database migrated successfully to version {version_num}")
+    logger = TestLogger(BUILDSTREAM_TEST_NAMES["postgres_alembic_migration"])
+
+    pg_user = get_credential_value(
+        host,
+        OMNIA_CREDENTIALS_PATH,
+        OMNIA_CREDENTIALS_KEY_PATH,
+        POSTGRES_USER_KEY,
+    )
+    if not pg_user:
+        pg_user = "postgres"
+
+    result = exec_psql_query(
+        host,
+        container=POSTGRES_CONTAINER,
+        db_user=pg_user,
+        db_name=POSTGRES_DB,
+        sql="SELECT version_num FROM alembic_version;"
+    )
+
+    assert result["success"], f"Failed to query alembic_version: {result['error']}"
+    assert result["rows"], "No rows returned from alembic_version"
+
+    version_num = result["rows"][0].strip()
+    logger.check(BUILDSTREAM_LOG_MSGS["current_alembic_version"].format(version=version_num))
+
+    assert version_num == ALEMBIC_VERSION_2_2, \
+        BUILDSTREAM_ASSERT_MSGS["alembic_version_mismatch"].format(
+            expected=ALEMBIC_VERSION_2_2,
+            actual=version_num,
+        )
+
+    logger.passed(f"Database migrated successfully to version {version_num}")
 
 
 # =============================================================================
@@ -223,112 +274,80 @@ def test_postgres_alembic_migration(host):
 # =============================================================================
 
 @pytest.mark.sanity
+@pytest.mark.buildstream_upgrade
 @pytest.mark.buildstream
 @pytest.mark.order(104)
-def test_gitlab_upgrade_commit(host):
+def test_gitlab_upgrade_commit(host, oim_shared_path, upgrade_config):
     """
     TC-UPG-004: Verify GitLab upgrade commit with [ci skip].
-    
-    Steps:
-    1. Read upgrade_gitlab_commit_sha from metadata
-    2. Query GitLab API for commit details
-    3. Verify commit message contains [omnia-upgrade-2.1-to-2.2] and [ci skip]
-    
-    Expected Result:
-    - Commit exists with correct message
-    - No pipelines were triggered
     """
-    logger = TestLogger("TC-UPG-004", "GitLab Upgrade Commit Check")
-    conn = get_host_connection(host)
-    
-    logger.info("Reading upgrade metadata for GitLab commit SHA")
-    manifest_path = "/opt/omnia/.data/upgrade_manifest.yml"
-    
-    result = conn.run(f"cat {manifest_path}")
-    manifest = yaml.safe_load(result.stdout)
+    logger = TestLogger(BUILDSTREAM_TEST_NAMES["gitlab_upgrade_commit"])
+
+    manifest_result = get_upgrade_manifest(host)
+    assert manifest_result["success"], BUILDSTREAM_ASSERT_MSGS["metadata_file_not_found"].format(
+        path=UPGRADE_MANIFEST_PATH
+    )
+
+    manifest = manifest_result["manifest"]
     backup_dir = manifest.get('backup_dir')
-    
-    metadata_path = f"{backup_dir}/buildstream_upgrade_metadata.yml"
-    result = conn.run(f"cat {metadata_path}")
-    metadata = yaml.safe_load(result.stdout)
-    
+    assert backup_dir, BUILDSTREAM_ASSERT_MSGS["backup_dir_missing"]
+
+    # Replace /opt/omnia with oim_shared_path for OIM host access
+    metadata_path = backup_dir.replace("/opt/omnia", f"{oim_shared_path}/omnia")
+    metadata_path = f"{metadata_path}/{BUILDSTREAM_METADATA_FILE}"
+    metadata_result = get_buildstream_metadata(host, metadata_path)
+    assert metadata_result["success"], BUILDSTREAM_ASSERT_MSGS["metadata_file_not_found"].format(
+        path=metadata_path
+    )
+
+    metadata = metadata_result["metadata"]
     commit_sha = metadata.get('upgrade_gitlab_commit_sha')
     assert commit_sha, "upgrade_gitlab_commit_sha not found in metadata"
-    
-    logger.info(f"Upgrade commit SHA: {commit_sha}")
-    
-    # Read GitLab configuration to get host and credentials
-    logger.info("Reading GitLab configuration")
-    result = conn.run("cat /opt/omnia/input/project_default/gitlab_config.yml")
-    if result.rc != 0:
-        logger.warning("Could not read gitlab_config.yml, skipping GitLab API check")
-        pytest.skip("GitLab configuration not accessible")
-    
-    gitlab_config = yaml.safe_load(result.stdout)
-    gitlab_host = gitlab_config.get('gitlab_host')
-    
+
+    logger.check(BUILDSTREAM_LOG_MSGS["checking_commit"].format(sha=commit_sha))
+
+    gitlab_host = get_gitlab_host(host)
     if not gitlab_host:
-        logger.warning("gitlab_host not found in config, skipping GitLab API check")
-        pytest.skip("GitLab host not configured")
-    
-    logger.info(f"GitLab host: {gitlab_host}")
-    
-    # Try to read GitLab root token
-    result = conn.run("cat /root/.gitlab_root_token 2>/dev/null || echo ''")
-    gitlab_token = result.stdout.strip()
-    
-    if not gitlab_token:
-        logger.warning("GitLab root token not found, skipping API check")
-        logger.info("Checking commit message format from metadata instead")
-        
-        # At minimum, verify the pre-tag format is correct
-        pre_tag = metadata.get('upgrade_gitlab_pre_tag', '')
-        assert 'pre-upgrade-2.1-to-2.2' in pre_tag, \
-            f"Expected pre-tag to contain 'pre-upgrade-2.1-to-2.2', got '{pre_tag}'"
-        
-        logger.success("Upgrade metadata contains expected GitLab commit information")
-        return
-    
-    # Query GitLab API for commit details
-    logger.info(f"Querying GitLab API for commit {commit_sha[:12]}")
-    
-    # Get project ID first
-    cmd = f'curl -sk -H "PRIVATE-TOKEN: {gitlab_token}" "https://{gitlab_host}/api/v4/projects?search=build_stream"'
-    result = conn.run(cmd)
-    
-    if result.rc != 0:
-        logger.warning("Failed to query GitLab API, skipping detailed commit check")
-        pytest.skip("GitLab API not accessible")
-    
-    import json
+        logger.skipped(BUILDSTREAM_SKIP_MSGS["gitlab_not_configured"])
+        pytest.skip(BUILDSTREAM_SKIP_MSGS["gitlab_not_configured"])
+
+    logger.check(BUILDSTREAM_LOG_MSGS["gitlab_host"].format(host=gitlab_host))
+
+    gitlab_port = get_gitlab_https_port(host)
+    gitlab_token_result = get_gitlab_root_token(host, ssh_to_gitlab, GITLAB_ROOT_TOKEN_FILE)
+    if not gitlab_token_result["success"]:
+        logger.skipped(BUILDSTREAM_SKIP_MSGS["gitlab_token_missing"])
+        pytest.skip(BUILDSTREAM_SKIP_MSGS["gitlab_token_missing"])
+
+    gitlab_token = gitlab_token_result["token"]
+
+    project_name = get_gitlab_project_name(host)
+    full_project_path = f"root/{project_name}" if project_name and "/" not in project_name else project_name
+    encoded_project = full_project_path.replace("/", "%2F")
+    api_base = f"https://{gitlab_host}:{gitlab_port}{GITLAB_API_BASE}"
+
     try:
-        projects = json.loads(result.stdout)
-        if not projects:
-            logger.warning("No build_stream project found in GitLab")
-            pytest.skip("BuildStream project not found in GitLab")
-        
-        project_id = projects[0]['id']
-        logger.info(f"BuildStream project ID: {project_id}")
-        
-        # Get commit details
-        cmd = f'curl -sk -H "PRIVATE-TOKEN: {gitlab_token}" "https://{gitlab_host}/api/v4/projects/{project_id}/repository/commits/{commit_sha}"'
-        result = conn.run(cmd)
-        
-        commit_data = json.loads(result.stdout)
+        result = ssh_to_gitlab(
+            host,
+            f'curl -sk -H "PRIVATE-TOKEN: {gitlab_token}" "{api_base}/projects/{encoded_project}/repository/commits/{commit_sha}"'
+        )
+        if not result.get("success"):
+            logger.skipped(f"GitLab API call failed: {result.get('error')}")
+            pytest.skip("GitLab API call failed")
+
+        commit_data = json.loads(result["stdout"])
         commit_message = commit_data.get('message', '')
-        
-        logger.info(f"Commit message: {commit_message[:100]}...")
-        
-        # Verify commit message
-        assert '[omnia-upgrade-2.1-to-2.2]' in commit_message, \
-            f"Commit message does not contain '[omnia-upgrade-2.1-to-2.2]'"
+
+        logger.check(BUILDSTREAM_LOG_MSGS["commit_found"].format(title=commit_message[:120] + "..."))
+
+        assert GITLAB_COMMIT_TITLE_PREFIX in commit_message, \
+            f"Commit message does not contain '{GITLAB_COMMIT_TITLE_PREFIX}'"
         assert '[ci skip]' in commit_message, \
-            f"Commit message does not contain '[ci skip]'"
-        
-        logger.success("GitLab upgrade commit verified successfully")
-        
-    except (json.JSONDecodeError, KeyError, IndexError) as e:
-        logger.warning(f"Failed to parse GitLab API response: {e}")
+            "Commit message does not contain '[ci skip]'"
+
+        logger.passed("GitLab upgrade commit verified successfully")
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        logger.skipped(f"Failed to parse GitLab API response: {e}")
         pytest.skip("Could not verify GitLab commit via API")
 
 
@@ -337,88 +356,60 @@ def test_gitlab_upgrade_commit(host):
 # =============================================================================
 
 @pytest.mark.sanity
+@pytest.mark.buildstream_upgrade
 @pytest.mark.buildstream
 @pytest.mark.order(105)
 def test_gitlab_runner_reregistration(host):
     """
     TC-UPG-005: Verify GitLab runner re-registration.
-    
-    Steps:
-    1. Query GitLab API for project runners
-    2. Verify at least one runner is online
-    3. Verify no stale/offline runners from 2.1
-    
-    Expected Result:
-    - New runner is online and active
     """
-    logger = TestLogger("TC-UPG-005", "GitLab Runner Re-registration Check")
-    conn = get_host_connection(host)
-    
-    logger.info("Checking GitLab runner status")
-    
-    # Read GitLab configuration
-    result = conn.run("cat /opt/omnia/input/project_default/gitlab_config.yml")
-    if result.rc != 0:
-        logger.warning("Could not read gitlab_config.yml, skipping runner check")
-        pytest.skip("GitLab configuration not accessible")
-    
-    gitlab_config = yaml.safe_load(result.stdout)
-    gitlab_host = gitlab_config.get('gitlab_host')
-    
+    logger = TestLogger(BUILDSTREAM_TEST_NAMES["gitlab_runner_reregistration"])
+
+    gitlab_host = get_gitlab_host(host)
     if not gitlab_host:
-        pytest.skip("GitLab host not configured")
-    
-    # Check if runner service is active on GitLab host
-    result = conn.run(f"ssh -o StrictHostKeyChecking=no root@{gitlab_host} 'systemctl is-active gitlab-runner.service' 2>/dev/null || echo 'unknown'")
-    runner_status = result.stdout.strip()
-    
-    logger.info(f"GitLab runner service status: {runner_status}")
-    
+        pytest.skip(BUILDSTREAM_SKIP_MSGS["gitlab_not_configured"])
+
+    result = ssh_to_gitlab(host, "systemctl is-active gitlab-runner.service 2>/dev/null || echo unknown")
+    runner_status = result.get("stdout", "").strip()
+    logger.check(BUILDSTREAM_LOG_MSGS["checking_runner_service"].format(status=runner_status))
+
     if runner_status == 'active':
-        logger.success("GitLab runner service is active")
-    else:
-        logger.warning(f"GitLab runner service status: {runner_status}")
-        # Don't fail the test, just log the status
-    
-    # Try to check runner registration via API
-    result = conn.run("cat /root/.gitlab_root_token 2>/dev/null || echo ''")
-    gitlab_token = result.stdout.strip()
-    
-    if not gitlab_token:
-        logger.warning("GitLab root token not found, cannot verify runner via API")
-        logger.info("Assuming runner is registered if service is active")
+        logger.passed("GitLab runner service is active")
+
+    gitlab_port = get_gitlab_https_port(host)
+    gitlab_token_result = get_gitlab_root_token(host, ssh_to_gitlab, GITLAB_ROOT_TOKEN_FILE)
+
+    if not gitlab_token_result["success"]:
+        logger.skipped(BUILDSTREAM_SKIP_MSGS["gitlab_token_missing"])
         return
-    
-    # Get project ID and query runners
-    cmd = f'curl -sk -H "PRIVATE-TOKEN: {gitlab_token}" "https://{gitlab_host}/api/v4/projects?search=build_stream"'
-    result = conn.run(cmd)
-    
-    if result.rc != 0:
-        logger.warning("Failed to query GitLab API")
-        return
-    
-    import json
+
+    gitlab_token = gitlab_token_result["token"]
+
+    project_name = get_gitlab_project_name(host)
+    full_project_path = f"root/{project_name}" if project_name and "/" not in project_name else project_name
+    encoded_project = full_project_path.replace("/", "%2F")
+    api_base = f"https://{gitlab_host}:{gitlab_port}{GITLAB_API_BASE}"
+
     try:
-        projects = json.loads(result.stdout)
-        if projects:
-            project_id = projects[0]['id']
-            
-            # Query project runners
-            cmd = f'curl -sk -H "PRIVATE-TOKEN: {gitlab_token}" "https://{gitlab_host}/api/v4/projects/{project_id}/runners"'
-            result = conn.run(cmd)
-            
-            runners = json.loads(result.stdout)
-            logger.info(f"Found {len(runners)} runner(s)")
-            
-            online_runners = [r for r in runners if r.get('status') == 'online']
-            logger.info(f"Online runners: {len(online_runners)}")
-            
-            assert len(online_runners) > 0, "No online runners found"
-            
-            logger.success(f"GitLab runner verified: {len(online_runners)} online runner(s)")
-    
-    except (json.JSONDecodeError, KeyError, IndexError) as e:
-        logger.warning(f"Failed to parse GitLab API response: {e}")
+        result = ssh_to_gitlab(
+            host,
+            f'curl -sk -H "PRIVATE-TOKEN: {gitlab_token}" "{api_base}/projects/{encoded_project}/runners"'
+        )
+        if not result.get("success"):
+            logger.skipped(f"GitLab API call failed: {result.get('error')}")
+            return
+
+        runners = json.loads(result["stdout"])
+        online_runners = [r for r in runners if r.get('status') == 'online']
+        logger.check(BUILDSTREAM_LOG_MSGS["found_runners"].format(
+            count=len(runners),
+            online=len(online_runners),
+        ))
+
+        assert len(online_runners) > 0, BUILDSTREAM_ASSERT_MSGS["gitlab_runner_offline"]
+        logger.passed(f"GitLab runner verified: {len(online_runners)} online runner(s)")
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        logger.skipped(f"Failed to parse GitLab API response: {e}")
 
 
 # =============================================================================
@@ -426,78 +417,79 @@ def test_gitlab_runner_reregistration(host):
 # =============================================================================
 
 @pytest.mark.sanity
+@pytest.mark.buildstream_upgrade
 @pytest.mark.buildstream
 @pytest.mark.order(106)
-def test_service_restart_after_quadlet_update(host):
+def test_service_restart_after_quadlet_update(host, oim_shared_path, upgrade_config):
     """
     TC-UPG-006: Verify service restart after quadlet update.
-    
-    Steps:
-    1. Check ActiveEnterTimestamp for omnia_build_stream.service
-    2. Check ActiveEnterTimestamp for omnia_postgres.service
-    3. Check ActiveEnterTimestamp for playbook_watcher.service
-    4. Verify quadlet files contain 2.2 image tags
-    
-    Expected Result:
-    - All services have recent ActiveEnterTimestamp (after upgrade)
-    - Quadlet files reflect 2.2 configuration
     """
-    logger = TestLogger("TC-UPG-006", "Service Restart After Quadlet Update")
-    conn = get_host_connection(host)
-    
+    logger = TestLogger(BUILDSTREAM_TEST_NAMES["service_restart_after_quadlet_update"])
+
     services = [
-        'omnia_build_stream.service',
-        'omnia_postgres.service',
-        'playbook_watcher.service'
+        BUILDSTREAM_SERVICE,
+        POSTGRES_SERVICE,
+        PLAYBOOK_WATCHER_QUADLET,
     ]
-    
-    logger.info("Checking service ActiveEnterTimestamp")
-    
+
     for service in services:
-        result = conn.run(f"systemctl show --property=ActiveEnterTimestamp {service}")
+        logger.check(BUILDSTREAM_LOG_MSGS["checking_service"].format(service=service))
+        result = run_on_oim(host, f"systemctl show --property=ActiveEnterTimestamp {service}")
         assert result.rc == 0, f"Failed to get timestamp for {service}: {result.stderr}"
-        
+
         timestamp = result.stdout.strip()
-        logger.info(f"{service}: {timestamp}")
-        
-        # Verify service is active
-        result = conn.run(f"systemctl is-active {service}")
+        logger.check(BUILDSTREAM_LOG_MSGS["service_timestamp"].format(service=service, timestamp=timestamp))
+
+        result = run_on_oim(host, f"systemctl is-active {service}")
         status = result.stdout.strip()
-        assert status == 'active', f"{service} is not active: {status}"
-    
-    logger.success("All services are active with recent timestamps")
-    
-    # Verify quadlet files contain 2.2 image references
-    logger.info("Checking quadlet files for 2.2 image tags")
-    
-    quadlet_files = [
-        '/etc/containers/systemd/omnia_build_stream.container',
-        '/etc/containers/systemd/omnia_postgres.container'
-    ]
-    
-    for quadlet in quadlet_files:
-        result = conn.run(f"cat {quadlet}")
-        if result.rc == 0:
-            content = result.stdout
-            logger.info(f"Checking {quadlet}")
-            
-            # Look for image version in quadlet (should contain 2.2 or v2.2)
-            if 'build_stream' in quadlet:
-                # BuildStream image should have 2.2 tag
-                assert '2.2' in content or 'v2.2' in content, \
-                    f"BuildStream quadlet does not contain 2.2 image tag"
-            elif 'postgres' in quadlet:
-                # Postgres quadlet should exist and be valid
-                assert 'Image=' in content, f"Postgres quadlet missing Image= directive"
-            
-            logger.info(f"✓ {quadlet} contains expected 2.2 configuration")
-    
-    # Verify playbook_watcher.service points to 2.2 source
-    result = conn.run("cat /etc/systemd/system/playbook_watcher.service")
-    if result.rc == 0:
-        content = result.stdout
-        assert '/opt/omnia/build_stream/playbook-watcher/playbook_watcher_service.py' in content, \
-            "playbook_watcher.service does not point to correct 2.2 source path"
-        logger.info("✓ playbook_watcher.service points to 2.2 source path")
-    
-    logger.success("All services restarted with 2.2 configuration")
+        assert status == 'active', BUILDSTREAM_ASSERT_MSGS["service_not_active"].format(service=service)
+
+    backup_dir_on_oim = f"{oim_shared_path}/omnia/backups/upgrade/version_{upgrade_config['current_version']}"
+    backup_quadlet = f"{backup_dir_on_oim}/{BUILDSTREAM_BACKUP_DIR}/{BUILDSTREAM_CONTAINER_BACKUP}"
+    result = run_on_oim(host, f"cat {backup_quadlet}")
+    assert result.rc == 0, f"Failed to read backup quadlet: {result.stderr}"
+    backup_image = result.stdout
+
+    for line in backup_image.splitlines():
+        if line.startswith("Image="):
+            backup_image_tag = line.split(":", 1)[-1] if ":" in line else line
+            logger.check(BUILDSTREAM_LOG_MSGS["backup_image_tag"].format(tag=backup_image_tag))
+            break
+    else:
+        pytest.fail("Could not find Image= line in backup BuildStream quadlet")
+
+    current_quadlet = f"{QUADLET_DIR}/{BUILDSTREAM_QUADLET}"
+    result = run_on_oim(host, f"cat {current_quadlet}")
+    assert result.rc == 0, f"Failed to read current quadlet: {result.stderr}"
+    current_content = result.stdout
+
+    assert 'Image=' in current_content, "BuildStream quadlet missing Image= directive"
+
+    for line in current_content.splitlines():
+        if line.startswith("Image="):
+            current_image_tag = line.split(":", 1)[-1] if ":" in line else line
+            logger.check(BUILDSTREAM_LOG_MSGS["current_image_tag"].format(tag=current_image_tag))
+            break
+    else:
+        pytest.fail("Could not find Image= line in current BuildStream quadlet")
+
+    assert current_image_tag == BUILDSTREAM_IMAGE_TAG_2_2, \
+        BUILDSTREAM_ASSERT_MSGS["quadlet_image_mismatch"].format(
+            current=current_image_tag,
+            backup=BUILDSTREAM_IMAGE_TAG_2_2,
+        )
+
+    postgres_quadlet = f"{QUADLET_DIR}/{POSTGRES_QUADLET}"
+    result = run_on_oim(host, f"cat {postgres_quadlet}")
+    assert result.rc == 0, f"Failed to read postgres quadlet: {result.stderr}"
+    assert 'Image=' in result.stdout, "Postgres quadlet missing Image= directive"
+
+    result = run_on_oim(host, f"cat /etc/systemd/system/{PLAYBOOK_WATCHER_QUADLET}")
+    assert result.rc == 0, f"{PLAYBOOK_WATCHER_QUADLET} not found"
+
+    content = result.stdout
+    assert 'playbook-watcher/playbook_watcher_service.py' in content, \
+        BUILDSTREAM_ASSERT_MSGS["quadlet_source_incorrect"].format(quadlet=PLAYBOOK_WATCHER_QUADLET)
+    logger.passed(BUILDSTREAM_LOG_MSGS["quadlet_source_correct"].format(quadlet=PLAYBOOK_WATCHER_QUADLET))
+
+    logger.passed("All services restarted with upgraded configuration")

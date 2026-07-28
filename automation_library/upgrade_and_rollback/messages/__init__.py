@@ -38,6 +38,12 @@ from .rollback_core_msgs import (
     ROLLBACK_ASSERT_MSGS,
     ROLLBACK_SKIP_MSGS,
 )
+from .buildstream_msgs import (
+    TEST_NAMES as BUILDSTREAM_TEST_NAMES,
+    TEST_LOG_MSGS as BUILDSTREAM_LOG_MSGS,
+    TEST_ASSERT_MSGS as BUILDSTREAM_ASSERT_MSGS,
+    SKIP_MSGS as BUILDSTREAM_SKIP_MSGS,
+)
 
 # K8s & Telemetry upgrade
 from .k8s_telemetry_upgrade_msgs import (
@@ -67,6 +73,11 @@ __all__ = [
     "ROLLBACK_LOG_MSGS",
     "ROLLBACK_ASSERT_MSGS",
     "ROLLBACK_SKIP_MSGS",
+    # BuildStream
+    "BUILDSTREAM_TEST_NAMES",
+    "BUILDSTREAM_LOG_MSGS",
+    "BUILDSTREAM_ASSERT_MSGS",
+    "BUILDSTREAM_SKIP_MSGS",
     # K8s & Telemetry upgrade
     "PRECHECK_TEST_NAMES",
     "PRECHECK_LOG_MSGS",

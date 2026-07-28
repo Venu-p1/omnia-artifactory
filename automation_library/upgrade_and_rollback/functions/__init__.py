@@ -44,6 +44,13 @@ from .rollback_core_func import (
     verify_rollback_container,
     verify_rollback_backup_md5sum,
 )
+from .buildstream_func import (
+    read_container_file,
+    read_oim_file,
+    get_gitlab_root_token,
+    get_upgrade_manifest,
+    get_buildstream_metadata,
+)
 
 # K8s & Telemetry upgrade pre/post check
 from .precheck_func import (
@@ -164,6 +171,12 @@ __all__ = [
     "run_omnia_rollback",
     "verify_rollback_container",
     "verify_rollback_backup_md5sum",
+    # BuildStream
+    "read_container_file",
+    "read_oim_file",
+    "get_gitlab_root_token",
+    "get_upgrade_manifest",
+    "get_buildstream_metadata",
     # K8s & Telemetry pre-check collectors
     "collect_k8s_node_versions",
     "collect_node_readiness",

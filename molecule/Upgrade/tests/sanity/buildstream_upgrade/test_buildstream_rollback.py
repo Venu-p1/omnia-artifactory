@@ -24,23 +24,92 @@ Tests the rollback-specific mechanisms for BuildStream including:
 - Service restart after restoration
 
 Prerequisites:
-- System must be in 2.2 upgraded state
-- Rollback must have been executed successfully
-
-Test cases (executed in order):
-1. TC-RBK-001: Verify DB migration downgrade (007 → 005)
-2. TC-RBK-002: Verify GitLab revert commit
-3. TC-RBK-003: Verify GitLab config and runner restoration
-4. TC-RBK-004: Verify quadlet and BuildStream source restoration
-5. TC-RBK-005: Verify automation environment cleanup
-6. TC-RBK-008: Verify service restart after restoration
+- System must be rolled back to Omnia 2.1
 """
 
 import pytest
-import yaml
-import os
+import json
 
-from automation_library.core import TestLogger, get_host_connection
+from automation_library.core import (
+    TestLogger,
+    get_testinfra_host,
+    run_on_oim,
+    run_in_container,
+    exec_psql_query,
+    get_credential_value,
+    POSTGRES_CONTAINER,
+    POSTGRES_DB,
+    POSTGRES_USER_KEY,
+    OMNIA_CORE_CONTAINER,
+    OMNIA_CREDENTIALS_PATH,
+    OMNIA_CREDENTIALS_KEY_PATH,
+)
+from automation_library.upgrade_and_rollback.vars import (
+    ROLLBACK_VARS,
+    UPGRADE_MANIFEST_PATH,
+    BUILDSTREAM_BACKUP_DIR,
+    BUILDSTREAM_METADATA_FILE,
+    GITLAB_CONFIGS_DIR,
+    BUILDSTREAM_CONTAINER_BACKUP,
+    POSTGRES_CONTAINER_BACKUP,
+    BUILDSTREAM_DB_BACKUP,
+    GITLAB_RB_BACKUP,
+    GITLAB_SECRETS_BACKUP,
+    QUADLET_DIR,
+    BUILDSTREAM_QUADLET,
+    BUILDSTREAM_SERVICE,
+    POSTGRES_QUADLET,
+    POSTGRES_SERVICE,
+    PLAYBOOK_WATCHER_QUADLET,
+    BUILDSTREAM_IMAGE_TAG_2_1,
+    ALEMBIC_VERSION_2_1,
+    GITLAB_API_BASE,
+    GITLAB_COMMIT_TITLE_PREFIX,
+)
+from automation_library.upgrade_and_rollback.functions import (
+    get_oim_metadata,
+    read_container_file,
+    get_upgrade_manifest,
+    get_buildstream_metadata,
+    get_gitlab_root_token,
+)
+from automation_library.upgrade_and_rollback.messages import (
+    BUILDSTREAM_TEST_NAMES,
+    BUILDSTREAM_LOG_MSGS,
+    BUILDSTREAM_ASSERT_MSGS,
+    BUILDSTREAM_SKIP_MSGS,
+)
+from automation_library.gitlab.functions import (
+    get_gitlab_host,
+    get_gitlab_project_name,
+    get_gitlab_https_port,
+    ssh_to_gitlab,
+)
+from automation_library.gitlab.vars import GITLAB_ROOT_TOKEN_FILE
+
+
+@pytest.fixture(scope="module")
+def host():
+    """Get Testinfra host connected to OIM server."""
+    return get_testinfra_host()
+
+
+@pytest.fixture(scope="module")
+def rollback_config():
+    """Get rollback configuration from ROLLBACK_VARS."""
+    return {
+        "current_version": ROLLBACK_VARS["current_version"],
+        "new_version": ROLLBACK_VARS["new_version"],
+        "backup_path": ROLLBACK_VARS["backup_path"],
+    }
+
+
+@pytest.fixture(scope="module")
+def oim_shared_path(host):
+    """Get oim_shared_path from omnia_core metadata."""
+    metadata = get_oim_metadata(host, OMNIA_CORE_CONTAINER)
+    assert metadata["success"], f"Failed to read OIM metadata: {metadata['error']}"
+    return metadata["oim_shared_path"]
 
 
 # =============================================================================
@@ -48,39 +117,45 @@ from automation_library.core import TestLogger, get_host_connection
 # =============================================================================
 
 @pytest.mark.sanity
+@pytest.mark.buildstream_rollback
 @pytest.mark.buildstream
-@pytest.mark.rollback
 @pytest.mark.order(201)
 def test_db_migration_downgrade(host):
     """
-    TC-RBK-001: Verify DB migration downgrade (007 → 005).
-    
-    Steps:
-    1. Connect to omnia_postgres container
-    2. Query alembic_version table
-    3. Verify version_num is 005 (2.1 state)
-    
-    Expected Result:
-    - Database schema downgraded to version 005
+    TC-RBK-001: Verify DB migration downgrade to 2.1.
     """
-    logger = TestLogger("TC-RBK-001", "DB Migration Downgrade")
-    conn = get_host_connection(host)
-    
-    logger.info("Querying alembic_version from omnia_postgres container")
-    
-    cmd = 'podman exec omnia_postgres psql -U postgres -d build_stream_db -t -c "SELECT version_num FROM alembic_version;"'
-    result = conn.run(cmd)
-    
-    assert result.rc == 0, f"Failed to query alembic_version: {result.stderr}"
-    
-    version_num = result.stdout.strip()
-    logger.info(f"Current alembic version: {version_num}")
-    
-    # Verify version is 005 (2.1 state)
-    assert version_num == '005', \
-        f"Expected alembic version 005 (2.1), got {version_num}"
-    
-    logger.success(f"Database downgraded successfully to version {version_num}")
+    logger = TestLogger(BUILDSTREAM_TEST_NAMES["db_migration_downgrade"])
+
+    pg_user = get_credential_value(
+        host,
+        OMNIA_CREDENTIALS_PATH,
+        OMNIA_CREDENTIALS_KEY_PATH,
+        POSTGRES_USER_KEY,
+    )
+    if not pg_user:
+        pg_user = "postgres"
+
+    result = exec_psql_query(
+        host,
+        container=POSTGRES_CONTAINER,
+        db_user=pg_user,
+        db_name=POSTGRES_DB,
+        sql="SELECT version_num FROM alembic_version;"
+    )
+
+    assert result["success"], f"Failed to query alembic_version: {result['error']}"
+    assert result["rows"], "No rows returned from alembic_version"
+
+    version_num = result["rows"][0].strip()
+    logger.check(BUILDSTREAM_LOG_MSGS["current_alembic_version"].format(version=version_num))
+
+    assert version_num == ALEMBIC_VERSION_2_1, \
+        BUILDSTREAM_ASSERT_MSGS["alembic_version_mismatch"].format(
+            expected=ALEMBIC_VERSION_2_1,
+            actual=version_num,
+        )
+
+    logger.passed(f"Database downgraded successfully to version {version_num}")
 
 
 # =============================================================================
@@ -89,117 +164,85 @@ def test_db_migration_downgrade(host):
 
 @pytest.mark.sanity
 @pytest.mark.buildstream
-@pytest.mark.rollback
+@pytest.mark.buildstream_rollback
 @pytest.mark.order(202)
-def test_gitlab_revert_commit(host):
+def test_gitlab_revert_commit(host, oim_shared_path, rollback_config):
     """
     TC-RBK-002: Verify GitLab revert commit.
-    
-    Steps:
-    1. Read upgrade_gitlab_commit_sha from metadata
-    2. Query GitLab API for recent commits
-    3. Verify a revert commit exists
-    
-    Expected Result:
-    - Revert commit exists referencing the upgrade commit SHA
     """
-    logger = TestLogger("TC-RBK-002", "GitLab Revert Commit Check")
-    conn = get_host_connection(host)
-    
-    logger.info("Reading upgrade metadata for GitLab commit SHA")
-    manifest_path = "/opt/omnia/.data/upgrade_manifest.yml"
-    
-    result = conn.run(f"cat {manifest_path}")
-    if result.rc != 0:
-        logger.warning("upgrade_manifest.yml not found, skipping GitLab revert check")
+    logger = TestLogger(BUILDSTREAM_TEST_NAMES["gitlab_revert_commit"])
+
+    manifest_result = get_upgrade_manifest(host)
+    if not manifest_result["success"]:
+        logger.skipped("upgrade_manifest.yml not found, skipping GitLab revert check")
         pytest.skip("Upgrade manifest not accessible")
-    
-    manifest = yaml.safe_load(result.stdout)
+
+    manifest = manifest_result["manifest"]
     backup_dir = manifest.get('backup_dir')
-    
     if not backup_dir:
         pytest.skip("backup_dir not found in manifest")
-    
-    metadata_path = f"{backup_dir}/buildstream_upgrade_metadata.yml"
-    result = conn.run(f"cat {metadata_path}")
-    
-    if result.rc != 0:
-        logger.warning("Upgrade metadata not found, skipping GitLab revert check")
+
+    # Replace /opt/omnia with oim_shared_path for OIM host access
+    metadata_path = backup_dir.replace("/opt/omnia", f"{oim_shared_path}/omnia")
+    metadata_path = f"{metadata_path}/{BUILDSTREAM_METADATA_FILE}"
+    metadata_result = get_buildstream_metadata(host, metadata_path)
+    if not metadata_result["success"]:
+        logger.skipped("Upgrade metadata not found, skipping GitLab revert check")
         pytest.skip("Upgrade metadata not accessible")
-    
-    metadata = yaml.safe_load(result.stdout)
+
+    metadata = metadata_result["metadata"]
     commit_sha = metadata.get('upgrade_gitlab_commit_sha')
-    
     if not commit_sha:
-        logger.warning("upgrade_gitlab_commit_sha not found in metadata")
+        logger.skipped("upgrade_gitlab_commit_sha not found in metadata")
         pytest.skip("Upgrade commit SHA not available")
-    
-    logger.info(f"Original upgrade commit SHA: {commit_sha}")
-    
-    # Read GitLab configuration
-    result = conn.run("cat /opt/omnia/input/project_default/gitlab_config.yml")
-    if result.rc != 0:
-        logger.warning("Could not read gitlab_config.yml, skipping GitLab API check")
-        pytest.skip("GitLab configuration not accessible")
-    
-    gitlab_config = yaml.safe_load(result.stdout)
-    gitlab_host = gitlab_config.get('gitlab_host')
-    
+
+    logger.check(f"Original upgrade commit SHA: {commit_sha}")
+
+    gitlab_host = get_gitlab_host(host)
     if not gitlab_host:
-        pytest.skip("GitLab host not configured")
-    
-    # Try to read GitLab root token
-    result = conn.run("cat /root/.gitlab_root_token 2>/dev/null || echo ''")
-    gitlab_token = result.stdout.strip()
-    
-    if not gitlab_token:
-        logger.warning("GitLab root token not found, cannot verify revert via API")
-        logger.info("Assuming revert was successful based on rollback completion")
+        pytest.skip(BUILDSTREAM_SKIP_MSGS["gitlab_not_configured"])
+
+    logger.check(BUILDSTREAM_LOG_MSGS["gitlab_host"].format(host=gitlab_host))
+
+    gitlab_port = get_gitlab_https_port(host)
+    gitlab_token_result = get_gitlab_root_token(host, ssh_to_gitlab, GITLAB_ROOT_TOKEN_FILE)
+    if not gitlab_token_result["success"]:
+        logger.skipped(BUILDSTREAM_SKIP_MSGS["gitlab_token_missing"])
         return
-    
-    # Query GitLab API for recent commits
-    logger.info("Querying GitLab API for recent commits")
-    
-    cmd = f'curl -sk -H "PRIVATE-TOKEN: {gitlab_token}" "https://{gitlab_host}/api/v4/projects?search=build_stream"'
-    result = conn.run(cmd)
-    
-    if result.rc != 0:
-        logger.warning("Failed to query GitLab API")
-        pytest.skip("GitLab API not accessible")
-    
-    import json
+
+    gitlab_token = gitlab_token_result["token"]
+
+    project_name = get_gitlab_project_name(host)
+    full_project_path = f"root/{project_name}" if project_name and "/" not in project_name else project_name
+    encoded_project = full_project_path.replace("/", "%2F")
+    api_base = f"https://{gitlab_host}:{gitlab_port}{GITLAB_API_BASE}"
+
     try:
-        projects = json.loads(result.stdout)
-        if not projects:
-            pytest.skip("BuildStream project not found in GitLab")
-        
-        project_id = projects[0]['id']
-        
-        # Get recent commits
-        cmd = f'curl -sk -H "PRIVATE-TOKEN: {gitlab_token}" "https://{gitlab_host}/api/v4/projects/{project_id}/repository/commits?per_page=10"'
-        result = conn.run(cmd)
-        
-        commits = json.loads(result.stdout)
-        logger.info(f"Found {len(commits)} recent commits")
-        
-        # Look for revert commit
+        result = ssh_to_gitlab(
+            host,
+            f'curl -sk -H "PRIVATE-TOKEN: {gitlab_token}" "{api_base}/projects/{encoded_project}/repository/commits?per_page=10"'
+        )
+        if not result.get("success"):
+            logger.skipped(f"GitLab API call failed: {result.get('error')}")
+            pytest.skip("GitLab API call failed")
+
+        commits = json.loads(result["stdout"])
+
         revert_found = False
         for commit in commits:
             message = commit.get('message', '')
             if 'Revert' in message or commit_sha[:12] in message:
-                logger.info(f"Found revert commit: {commit['id'][:12]}")
-                logger.info(f"Message: {message[:100]}...")
+                logger.check(f"Found revert commit: {commit['id'][:12]}")
                 revert_found = True
                 break
-        
+
         if revert_found:
-            logger.success("GitLab revert commit verified")
+            logger.passed("GitLab revert commit verified")
         else:
-            logger.warning("Revert commit not found in recent history, but rollback may have succeeded")
-            # Don't fail the test, as the revert might have been done differently
-    
-    except (json.JSONDecodeError, KeyError, IndexError) as e:
-        logger.warning(f"Failed to parse GitLab API response: {e}")
+            logger.skipped("Revert commit not found in recent history")
+
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        logger.skipped(f"Failed to parse GitLab API response: {e}")
         pytest.skip("Could not verify GitLab revert via API")
 
 
@@ -209,68 +252,40 @@ def test_gitlab_revert_commit(host):
 
 @pytest.mark.sanity
 @pytest.mark.buildstream
-@pytest.mark.rollback
+@pytest.mark.buildstream_rollback
 @pytest.mark.order(203)
 def test_gitlab_config_runner_restoration(host):
     """
     TC-RBK-003: Verify GitLab config and runner restoration.
-    
-    Steps:
-    1. Check gitlab.rb and gitlab-secrets.json timestamps
-    2. Verify runner service is active
-    3. Verify runner quadlet was restored
-    
-    Expected Result:
-    - GitLab configs restored from backup
-    - Runner service active
     """
-    logger = TestLogger("TC-RBK-003", "GitLab Config & Runner Restoration")
-    conn = get_host_connection(host)
-    
-    # Read GitLab configuration
-    result = conn.run("cat /opt/omnia/input/project_default/gitlab_config.yml")
-    if result.rc != 0:
-        logger.warning("Could not read gitlab_config.yml, skipping GitLab checks")
-        pytest.skip("GitLab configuration not accessible")
-    
-    gitlab_config = yaml.safe_load(result.stdout)
-    gitlab_host = gitlab_config.get('gitlab_host')
-    
+    logger = TestLogger(BUILDSTREAM_TEST_NAMES["gitlab_config_restoration"])
+
+    gitlab_host = get_gitlab_host(host)
     if not gitlab_host:
-        pytest.skip("GitLab host not configured")
-    
-    logger.info(f"Checking GitLab configuration on host: {gitlab_host}")
-    
-    # Check gitlab.rb exists
-    result = conn.run(f"ssh -o StrictHostKeyChecking=no root@{gitlab_host} 'test -f /etc/gitlab/gitlab.rb && echo exists' 2>/dev/null || echo 'not found'")
-    gitlab_rb_status = result.stdout.strip()
-    
-    if gitlab_rb_status == 'exists':
-        logger.info("✓ gitlab.rb exists")
+        pytest.skip(BUILDSTREAM_SKIP_MSGS["gitlab_not_configured"])
+
+    logger.check(BUILDSTREAM_LOG_MSGS["gitlab_host"].format(host=gitlab_host))
+
+    result = ssh_to_gitlab(host, "test -f /etc/gitlab/gitlab.rb && echo exists || echo not_found")
+    if result.get("stdout", "").strip() == 'exists':
+        logger.passed("gitlab.rb exists")
     else:
-        logger.warning("gitlab.rb not found or not accessible")
-    
-    # Check gitlab-secrets.json exists
-    result = conn.run(f"ssh -o StrictHostKeyChecking=no root@{gitlab_host} 'test -f /etc/gitlab/gitlab-secrets.json && echo exists' 2>/dev/null || echo 'not found'")
-    secrets_status = result.stdout.strip()
-    
-    if secrets_status == 'exists':
-        logger.info("✓ gitlab-secrets.json exists")
+        logger.skipped("gitlab.rb not found or not accessible")
+
+    result = ssh_to_gitlab(host, "test -f /etc/gitlab/gitlab-secrets.json && echo exists || echo not_found")
+    if result.get("stdout", "").strip() == 'exists':
+        logger.passed("gitlab-secrets.json exists")
     else:
-        logger.warning("gitlab-secrets.json not found or not accessible")
-    
-    # Check runner service status
-    result = conn.run(f"ssh -o StrictHostKeyChecking=no root@{gitlab_host} 'systemctl is-active gitlab-runner.service' 2>/dev/null || echo 'unknown'")
-    runner_status = result.stdout.strip()
-    
-    logger.info(f"GitLab runner service status: {runner_status}")
-    
+        logger.skipped("gitlab-secrets.json not found or not accessible")
+
+    result = ssh_to_gitlab(host, "systemctl is-active gitlab-runner.service 2>/dev/null || echo unknown")
+    runner_status = result.get("stdout", "").strip()
+    logger.check(BUILDSTREAM_LOG_MSGS["checking_runner_service"].format(status=runner_status))
+
     if runner_status == 'active':
-        logger.success("GitLab runner service is active")
-    else:
-        logger.warning(f"GitLab runner service status: {runner_status}")
-    
-    logger.success("GitLab configuration and runner restoration verified")
+        logger.passed("GitLab runner service is active")
+
+    logger.passed("GitLab configuration and runner restoration verified")
 
 
 # =============================================================================
@@ -279,66 +294,68 @@ def test_gitlab_config_runner_restoration(host):
 
 @pytest.mark.sanity
 @pytest.mark.buildstream
-@pytest.mark.rollback
+@pytest.mark.buildstream_rollback
 @pytest.mark.order(204)
-def test_quadlet_source_restoration(host):
+def test_quadlet_source_restoration(host, oim_shared_path, rollback_config):
     """
     TC-RBK-004: Verify quadlet and BuildStream source restoration.
-    
-    Steps:
-    1. Check quadlet files for 2.1 image tags
-    2. Verify BuildStream source directory restored
-    
-    Expected Result:
-    - Quadlet files contain 2.1 image references
-    - BuildStream source matches 2.1 version
     """
-    logger = TestLogger("TC-RBK-004", "Quadlet and Source Restoration")
-    conn = get_host_connection(host)
-    
-    logger.info("Checking quadlet files for 2.1 image tags")
-    
-    quadlet_files = [
-        '/etc/containers/systemd/omnia_build_stream.container',
-        '/etc/containers/systemd/omnia_postgres.container'
-    ]
-    
-    for quadlet in quadlet_files:
-        result = conn.run(f"cat {quadlet}")
-        if result.rc == 0:
-            content = result.stdout
-            logger.info(f"Checking {quadlet}")
-            
-            # Look for image version in quadlet (should contain 2.1 or v2.1)
-            if 'build_stream' in quadlet:
-                # BuildStream image should have 2.1 tag
-                assert '2.1' in content or 'v2.1' in content, \
-                    f"BuildStream quadlet does not contain 2.1 image tag"
-                logger.info(f"✓ {quadlet} contains 2.1 image tag")
-            elif 'postgres' in quadlet:
-                # Postgres quadlet should exist and be valid
-                assert 'Image=' in content, f"Postgres quadlet missing Image= directive"
-                logger.info(f"✓ {quadlet} is valid")
-        else:
-            logger.warning(f"Could not read {quadlet}")
-    
-    # Check BuildStream source directory
-    logger.info("Checking BuildStream source directory")
-    result = conn.run("test -d /opt/omnia/build_stream && echo exists || echo missing")
-    source_status = result.stdout.strip()
-    
-    assert source_status == 'exists', "BuildStream source directory not found"
-    logger.info("✓ BuildStream source directory exists")
-    
-    # Verify playbook_watcher.service points to 2.1 source
-    result = conn.run("cat /etc/systemd/system/playbook_watcher.service")
-    if result.rc == 0:
-        content = result.stdout
-        assert '/opt/omnia/build_stream/playbook-watcher/playbook_watcher_service.py' in content, \
-            "playbook_watcher.service does not point to correct source path"
-        logger.info("✓ playbook_watcher.service points to correct 2.1 source path")
-    
-    logger.success("Quadlet and BuildStream source restoration verified")
+    logger = TestLogger(BUILDSTREAM_TEST_NAMES["quadlet_restoration"])
+
+    backup_dir_on_oim = f"{oim_shared_path}/omnia/backups/upgrade/version_{rollback_config['current_version']}"
+    backup_quadlet = f"{backup_dir_on_oim}/{BUILDSTREAM_BACKUP_DIR}/{BUILDSTREAM_CONTAINER_BACKUP}"
+    result = run_on_oim(host, f"cat {backup_quadlet}")
+    assert result.rc == 0, f"Failed to read backup quadlet: {result.stderr}"
+    backup_content = result.stdout
+
+    for line in backup_content.splitlines():
+        if line.startswith("Image="):
+            backup_image_tag = line.split(":", 1)[-1] if ":" in line else line
+            logger.check(BUILDSTREAM_LOG_MSGS["backup_image_tag"].format(tag=backup_image_tag))
+            break
+    else:
+        pytest.fail("Could not find Image= line in backup BuildStream quadlet")
+
+    current_quadlet = f"{QUADLET_DIR}/{BUILDSTREAM_QUADLET}"
+    result = run_on_oim(host, f"cat {current_quadlet}")
+    assert result.rc == 0, f"Failed to read current quadlet: {result.stderr}"
+    current_content = result.stdout
+
+    assert 'Image=' in current_content, "BuildStream quadlet missing Image= directive"
+
+    for line in current_content.splitlines():
+        if line.startswith("Image="):
+            current_image_tag = line.split(":", 1)[-1] if ":" in line else line
+            logger.check(BUILDSTREAM_LOG_MSGS["current_image_tag"].format(tag=current_image_tag))
+            break
+    else:
+        pytest.fail("Could not find Image= line in current BuildStream quadlet")
+
+    assert current_image_tag == backup_image_tag, \
+        BUILDSTREAM_ASSERT_MSGS["quadlet_image_mismatch"].format(
+            current=current_image_tag,
+            backup=backup_image_tag,
+        )
+
+    postgres_quadlet = f"{QUADLET_DIR}/{POSTGRES_QUADLET}"
+    result = run_on_oim(host, f"cat {postgres_quadlet}")
+    assert result.rc == 0, f"Failed to read postgres quadlet: {result.stderr}"
+    assert 'Image=' in result.stdout, "Postgres quadlet missing Image= directive"
+
+    logger.check("Checking BuildStream source directory")
+    result = run_on_oim(host, "test -d /opt/omnia/build_stream && echo exists || echo missing")
+    assert result.stdout.strip() == 'exists', "BuildStream source directory not found"
+    logger.passed("BuildStream source directory exists")
+
+    result = run_on_oim(host, f"cat /etc/systemd/system/{PLAYBOOK_WATCHER_QUADLET}")
+    assert result.rc == 0, f"{PLAYBOOK_WATCHER_QUADLET} not found"
+
+    content = result.stdout
+    assert 'playbook-watcher/playbook_watcher_service.py' in content, \
+        BUILDSTREAM_ASSERT_MSGS["quadlet_source_incorrect"].format(quadlet=PLAYBOOK_WATCHER_QUADLET)
+    logger.passed(BUILDSTREAM_LOG_MSGS["quadlet_source_correct"].format(quadlet=PLAYBOOK_WATCHER_QUADLET))
+
+    logger.passed("Quadlet and BuildStream source restoration verified")
 
 
 # =============================================================================
@@ -347,33 +364,23 @@ def test_quadlet_source_restoration(host):
 
 @pytest.mark.sanity
 @pytest.mark.buildstream
-@pytest.mark.rollback
+@pytest.mark.buildstream_rollback
 @pytest.mark.order(205)
 def test_automation_environment_cleanup(host):
     """
     TC-RBK-005: Verify automation environment cleanup.
-    
-    Steps:
-    1. Check if /opt/omnia/automation/.venv directory exists
-    
-    Expected Result:
-    - .venv directory is removed (absent)
     """
-    logger = TestLogger("TC-RBK-005", "Automation Environment Cleanup")
-    conn = get_host_connection(host)
-    
-    logger.info("Checking automation .venv directory status")
-    
-    result = conn.run("test -d /opt/omnia/automation/.venv && echo exists || echo absent")
+    logger = TestLogger(BUILDSTREAM_TEST_NAMES["automation_env_cleanup"])
+
+    result = run_on_oim(host, "test -d /opt/omnia/automation/.venv && echo exists || echo absent")
     venv_status = result.stdout.strip()
-    
-    logger.info(f"Automation .venv status: {venv_status}")
-    
+
+    logger.check(f"Automation .venv status: {venv_status}")
+
     if venv_status == 'absent':
-        logger.success("Automation .venv directory successfully removed")
+        logger.passed("Automation .venv directory successfully removed")
     else:
-        logger.warning("Automation .venv directory still exists (may be recreated by watcher)")
-        # Don't fail the test as the venv might be recreated automatically
+        logger.skipped("Automation .venv directory still exists (may be recreated by watcher)")
 
 
 # =============================================================================
@@ -382,54 +389,40 @@ def test_automation_environment_cleanup(host):
 
 @pytest.mark.sanity
 @pytest.mark.buildstream
-@pytest.mark.rollback
+@pytest.mark.buildstream_rollback
 @pytest.mark.order(208)
 def test_service_restart_after_restoration(host):
     """
     TC-RBK-008: Verify service restart after restoration.
-    
-    Steps:
-    1. Check ActiveEnterTimestamp for omnia_build_stream.service
-    2. Check ActiveEnterTimestamp for omnia_postgres.service
-    3. Check ActiveEnterTimestamp for playbook_watcher.service
-    4. Verify all services are active
-    
-    Expected Result:
-    - All services have recent ActiveEnterTimestamp (after rollback)
-    - All services are active
     """
-    logger = TestLogger("TC-RBK-008", "Service Restart After Restoration")
-    conn = get_host_connection(host)
-    
+    logger = TestLogger(BUILDSTREAM_TEST_NAMES["service_restart_after_restoration"])
+
     services = [
-        'omnia_build_stream.service',
-        'omnia_postgres.service',
-        'playbook_watcher.service'
+        BUILDSTREAM_SERVICE,
+        POSTGRES_SERVICE,
+        PLAYBOOK_WATCHER_QUADLET,
     ]
-    
-    logger.info("Checking service ActiveEnterTimestamp after rollback")
-    
+
     for service in services:
-        result = conn.run(f"systemctl show --property=ActiveEnterTimestamp {service}")
+        logger.check(BUILDSTREAM_LOG_MSGS["checking_service"].format(service=service))
+        result = run_on_oim(host, f"systemctl show --property=ActiveEnterTimestamp {service}")
         assert result.rc == 0, f"Failed to get timestamp for {service}: {result.stderr}"
-        
+
         timestamp = result.stdout.strip()
-        logger.info(f"{service}: {timestamp}")
-        
-        # Verify service is active
-        result = conn.run(f"systemctl is-active {service}")
+        logger.check(BUILDSTREAM_LOG_MSGS["service_timestamp"].format(service=service, timestamp=timestamp))
+
+        result = run_on_oim(host, f"systemctl is-active {service}")
         status = result.stdout.strip()
-        assert status == 'active', f"{service} is not active: {status}"
-        logger.info(f"✓ {service} is active")
-    
-    logger.success("All services restarted successfully after rollback")
-    
-    # Verify daemon-reload was executed
-    logger.info("Checking for systemd daemon-reload in journal")
-    result = conn.run("journalctl -u systemd --since '10 minutes ago' | grep -i 'reload' | tail -5")
+        assert status == 'active', BUILDSTREAM_ASSERT_MSGS["service_not_active"].format(service=service)
+
+    logger.check("Checking for systemd daemon-reload in journal")
+    result = run_on_oim(
+        host,
+        "journalctl -u systemd --since '10 minutes ago' | grep -i 'reload' | tail -5"
+    )
     if result.rc == 0 and result.stdout.strip():
-        logger.info("✓ systemd daemon-reload evidence found in journal")
+        logger.passed("systemd daemon-reload evidence found in journal")
     else:
-        logger.info("No recent daemon-reload found in journal (may have been earlier)")
-    
-    logger.success("Service restart after restoration verified")
+        logger.check("No recent daemon-reload found in journal")
+
+    logger.passed("Service restart after restoration verified")
