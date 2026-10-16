@@ -11,9 +11,10 @@ The OIM operating system and the cluster-node operating system are separate
 support axes. A catalog selects the operating system used to build cluster-node
 images; it does not change or qualify the operating system running on the OIM.
 
-| OIM OS | Cluster-node OS | Omnia 2.3.0.0-rc1 status |
+| OIM OS | Cluster-node OS | Omnia 2.3.0.0-rc2 status |
 |---|---|---|
 | RHEL 10.0 | RHEL 10.0 | Validated |
+| RHEL 10.2 | RHEL 10.2 | Validated |
 
 The source distribution also contains RHEL 10.2 cluster-node catalogs. Their
 presence and acceptance by the catalog selector do not establish that RHEL

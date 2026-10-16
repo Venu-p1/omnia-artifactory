@@ -322,7 +322,7 @@ Only devices with `Link layer: InfiniBand` are used by Omnia.
 !!! danger "Review draft — not implemented"
     This section describes the intended Part 1a behavior from BR-34869 v4 and
     ER-ORCH-005. The behavior is not available in the current Omnia staging
-    source and is not part of the Omnia 2.3.0.0-rc1 support statement.
+    source and is not part of the Omnia 2.3.0.0-rc2 support statement.
 
     Field names, file formats, supported hardware, and operational commands
     remain subject to Engineering and SME review. Continue to use the IPv4

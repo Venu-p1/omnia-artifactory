@@ -14,22 +14,21 @@ src/main/samples/catalog_rhel.json
 
 The default catalog targets RHEL 10.0 and combines x86_64 management and
 service Kubernetes layers with aarch64 Slurm compute layers without VAST.
-Additional deployment-specific catalogs for RHEL 10.0 and RHEL 10.2 are
+Additional deployment-specific catalogs for RHEL 10.0, RHEL 10.2 and hybrid are
 available under:
 
 ```text
-src/main/samples/catalogs/<RHEL-version>/
-```
+# Catalogs for RHEL 10.0 and RHEL 10.2
+src/main/samples/catalogs/rhel/<RHEL-version>/
 
-The release bundle does not provide a prebuilt hybrid-version catalog or a
-`hybrid/` selector. Treat an AI-generated hybrid catalog as a custom catalog.
-Do not infer that a generated filename represents a shipped or validated
-configuration.
+# Catalogs for hybrid deployments
+src/main/samples/catalogs/hybrid/
+```
 
 !!! warning
 
     Bundled catalog availability is not a product-support statement. For Omnia
-    2.3.0.0-rc1, the documented validated combination is a RHEL 10.0 OIM with
+    2.3.0.0-rc2, the documented validated combination is a RHEL 10.0 OIM with
     RHEL 10.0 cluster nodes. The bundled RHEL 10.2 cluster-node catalogs do not
     have a published Supported, Validated, Technology preview, or Not supported
     classification. Until Engineering publishes that classification, use the

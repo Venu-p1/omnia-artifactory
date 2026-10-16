@@ -11,9 +11,9 @@ This page summarizes the features, enhancements, and changes introduced in each 
 | **Versioned Catalogs and Catalog-Aware Image Reuse** | Adds catalog schema versioning, composite `<identifier>-v<version>` image-group identities, catalog-specific build-status output, and a project-level global dictionary that reuses valid functional-group images when their package and repository inputs match. `build_image.force_rebuild` remains the single control for bypassing reuse. For details, see [Execute Build Pipeline](../HowTo/build_stream/execute_build_pipeline.md). |
 | **RHEL 10.2 Repository Support in Repository Manager** | Repository Manager resolves and synchronizes RPM repositories, container images, Python packages, files, and source artifacts for RHEL 10.2 in addition to RHEL 10.0, in both single-version and multi-version (hybrid RHEL 10.0 + RHEL 10.2) catalog configurations. Repository processing support for a selected RHEL version does not by itself establish that version as validated for the complete Omnia deployment; see the [Operating Systems Matrix](../Reference/SupportMatrix/operating_systems.md) for the current validated OIM and cluster-node combination. For details, see [Configure Repositories](../HowTo/repo_manager/configure_repos.md). |
 
-## Omnia v2.3.0.0-rc1
+## Omnia v2.3.0.0-rc2
 
-Omnia v2.3.0.0-rc1 is validated with RHEL 10.0 on the
+Omnia v2.3.0.0-rc2 is validated with RHEL 10.0 on the
 Omnia Infrastructure Manager (OIM) and cluster nodes. For operating-system
 requirements, see the
 [Operating Systems Matrix](../Reference/SupportMatrix/operating_systems.md).
