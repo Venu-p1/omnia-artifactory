@@ -62,7 +62,8 @@ requires the source ISO filename to contain `x86_64` or `aarch64`.
   vary by server model and architecture; verify them on equivalent hardware or
   through the server inventory before starting the installation.
 - Create the SSH public key configured by `ssh_public_key_path`. The default is
-  `/root/.ssh/id_rsa.pub`.
+  `/root/.ssh/id_rsa.pub`. This key is required for build_iso, generate_ks, and
+  deploy modes.
 
 The first installation run prompts for `bmc_username`, `bmc_password`, and
 `os_root_password`. The workflow stores them in an Ansible Vault-encrypted
@@ -279,7 +280,7 @@ file.
 | `netmask` | No | `255.255.255.0` | Static network mask. |
 | `gateway` | No | Empty | Static default gateway. Set this explicitly for a PowerEdge XE8712 `aarch64` node. |
 | `dns_server` | No | Empty | DNS server used by Kickstart. |
-| `ssh_public_key_path` | No | `/root/.ssh/id_rsa.pub` | Public key injected for root SSH access. |
+| `ssh_public_key_path` | Build, Kickstart generation, and deployment | `/root/.ssh/id_rsa.pub` | Public key injected for root SSH access. Required for build_iso, generate_ks, and deploy modes. |
 | `install_disk` | No | `sda` | Disk erased and used for installation. For a PowerEdge XE8712 `aarch64` node, use `nvme0n1`. |
 | `timezone` | No | `UTC` | Installed-system timezone. |
 | `rebuild_iso` | No | `false` | Rebuild an existing custom ISO. Set this to `true` after changing Kickstart-backed configuration. |

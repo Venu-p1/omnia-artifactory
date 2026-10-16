@@ -11,9 +11,9 @@ This page summarizes the features, enhancements, and changes introduced in each 
 | **Automated Build and Deployment with Cadence** | Adds support for periodic reconciliation of RPM repositories referenced by a cadence catalog through a new GitLab-based pipeline. The pipeline automatically increments the catalog version and performs repository configuration, differential image builds, deployment, node restarts, and validation workflows. For more information, see [Automate Build and Deployment with Cadence](../HowTo/build_stream/execute_cadence_pipeline.md). |
 | **Versioned Catalogs and Catalog-Aware Image Reuse** | Introduces catalog schema versioning, composite image-group identities, catalog-specific build-status reporting, image builds, and a project-level global image dictionary for reusing valid functional-group images across catalogs. For more information, see [Execute Build Pipeline](../HowTo/build_stream/execute_build_pipeline.md). |
 
-## Omnia v2.3.0.0-rc1
+## Omnia v2.3.0.0-rc2
 
-Omnia v2.3.0.0-rc1 is validated with RHEL 10.0 on the
+Omnia v2.3.0.0-rc2 is validated with RHEL 10.0 on the
 Omnia Infrastructure Manager (OIM) and cluster nodes. For operating-system
 requirements, see the
 [Operating Systems Matrix](../Reference/SupportMatrix/operating_systems.md).
