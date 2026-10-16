@@ -32,7 +32,7 @@ Do not invoke the companion instructions directly.
 
 - Access to an Omnia source checkout that contains
   `src/build_stream/ai_skills/`.
-- An approved AI assistant (with coding capabilities) with access to the checkout. Use the AI assistant in accordance with the organization's AI usage policies.
+- An AI assistant (with coding capabilities) with access to the checkout. Use the AI assistant in accordance with the organization's AI usage policies.
 - The catalogs or catalog requirements needed for the requested operation.
 
 ## Procedure
