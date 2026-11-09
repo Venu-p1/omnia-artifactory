@@ -78,7 +78,10 @@ OpenLDAP selection is catalog-driven. There is no `ldap_enabled` input and no
         ```
 
 4. Run the `prepare` phase and supply
-   `openldap_db_username` and `openldap_db_password` when prompted. The
+   `openldap_db_username` and `openldap_db_password` (directory admin) and
+   `openldap_bind_username` and `openldap_bind_password` (read-only account
+   that LDAP clients bind with; the password must differ from the admin
+   password) when prompted. The
    credential role stores them in `orchestrator_credentials.yml` in the active
    project's Orchestrator input directory and encrypts the file with
    `.orchestrator_credentials_key`.
@@ -107,8 +110,36 @@ OpenLDAP selection is catalog-driven. There is no `ldap_enabled` input and no
 
    The phase creates `$OMNIA_DATA_PATH/auth/config`, `tls_certs`, `data`, and
    `init`; generates `slapd.conf`, `bootstrap.ldif`, and a certificate; creates
-   `/etc/containers/systemd/omnia_auth.container`; and enables and starts the
-   `omnia_auth` systemd service.
+   `/etc/containers/systemd/omnia_auth.container`; enables and starts the
+   `omnia_auth` systemd service; and creates the read-only account
+   `cn=<openldap_bind_username>,ou=ServiceAccounts,<base>`.
+
+## Directory access
+
+- Anonymous clients can authenticate but cannot read directory entries. The
+  root DSE and schema remain readable.
+- LDAP clients (`sssd` on provisioned nodes) bind with the read-only account in
+  both `TLS` and `SSL` modes. The admin account is not written to nodes.
+- Authenticated users can read all entries except password hashes and can
+  change only their own entry.
+- Scripts or tools that query the directory anonymously must bind with an LDAP
+  account.
+
+!!! note "Upgrading an existing deployment"
+
+    The first run after upgrading prompts for the read-only bind credentials and
+    creates the account. Re-provision the LDAP client nodes afterwards so that
+    their `sssd.conf` uses the account. Until then, nodes using `TLS` keep their
+    previous binding, and nodes using `SSL` cannot look up LDAP users.
+
+**Rotating the read-only bind password**
+
+1. Update `openldap_bind_password` in `orchestrator_credentials.yml` by using
+   the approved encrypted-file update procedure.
+2. Run the `deploy` phase. The `omnia_auth` role resets the account password in
+   the directory.
+3. Re-provision the LDAP client nodes. Nodes that still have the old password
+   cannot look up LDAP users until they are re-provisioned.
 
 ## Verification
 
